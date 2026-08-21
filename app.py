@@ -7,7 +7,8 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 import streamlit as st
-from gtts import gTTS
+import asyncio
+import edge_tts
 from pydub import AudioSegment
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import resample_poly, stft, istft
@@ -176,14 +177,35 @@ def simulate_ear(x: np.ndarray, sr: int, thresholds, speech_level_db=65.0):
 # -----------------------------
 # TTS
 # -----------------------------
-def generate_tts(text: str):
+SOUTH_AFRICAN_VOICES = {
+    "Leah — South African English (female)": "en-ZA-LeahNeural",
+    "Luke — South African English (male)": "en-ZA-LukeNeural",
+}
+
+async def _edge_tts_bytes(text: str, voice: str):
+    communicate = edge_tts.Communicate(text=text, voice=voice)
+    audio = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio.extend(chunk["data"])
+    return bytes(audio)
+
+def generate_tts(text: str, voice: str):
     text = (text or "").strip()
     if not text:
         raise ValueError("Type a sentence first.")
-    mp3 = io.BytesIO()
-    gTTS(text=text, lang="en", slow=False).write_to_fp(mp3)
-    mp3.seek(0)
-    return decode_audio_bytes(mp3.getvalue(), ".mp3")
+
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        mp3_bytes = loop.run_until_complete(_edge_tts_bytes(text, voice))
+    finally:
+        loop.close()
+
+    if not mp3_bytes:
+        raise RuntimeError("The speech service returned no audio.")
+
+    return decode_audio_bytes(mp3_bytes, ".mp3")
 
 # -----------------------------
 # Audiogram helpers
@@ -693,20 +715,30 @@ with source_tab1:
         height=90,
     )
 
+    voice_label = st.selectbox(
+        "Generated voice",
+        list(SOUTH_AFRICAN_VOICES.keys()),
+        index=0,
+    )
+    voice_name = SOUTH_AFRICAN_VOICES[voice_label]
+
     if st.button("Generate normal speech", type="primary"):
         try:
-            x, sr = generate_tts(text)
+            x, sr = generate_tts(text, voice_name)
             st.session_state.source_wav = x
             st.session_state.source_sr = sr
-            st.session_state.source_label = "Generated speech"
+            st.session_state.source_label = voice_label
             st.session_state.simulated_bytes = None
-            st.success("Speech generated.")
+            st.success("South African English speech generated.")
         except Exception as e:
-            st.error("I couldn't generate speech right now. Try recording or uploading audio.")
+            st.error(
+                "I couldn't generate speech right now. "
+                "Try recording your own voice or uploading audio."
+            )
             st.caption(str(e))
 
     st.caption(
-        "Typed text is sent to Google's text-to-speech service. "
+        "Generated speech uses an online South African English text-to-speech service. "
         "Do not include identifying patient information."
     )
 
