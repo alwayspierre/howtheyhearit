@@ -27,6 +27,39 @@ DEFAULT_LEFT = [10, 15, 25, 45, 65, 70]
 DEFAULT_RIGHT = [10, 15, 25, 50, 70, 75]
 TARGET_SR = 44100
 
+PRESET_PROFILES = {
+    "Near-normal hearing": {
+        "left":  [5, 5, 10, 10, 10, 10],
+        "right": [5, 5, 10, 10, 10, 10],
+        "description": "Very little threshold loss across the speech frequencies.",
+    },
+    "Mild high-frequency loss": {
+        "left":  [10, 10, 15, 20, 35, 45],
+        "right": [10, 10, 15, 20, 35, 45],
+        "description": "Low frequencies remain relatively audible while softer high-frequency speech sounds become harder to access.",
+    },
+    "Moderate flat loss": {
+        "left":  [45, 45, 45, 45, 45, 45],
+        "right": [45, 45, 45, 45, 45, 45],
+        "description": "A broadly similar moderate loss across frequencies.",
+    },
+    "Sloping moderate–severe loss": {
+        "left":  [20, 25, 35, 50, 70, 80],
+        "right": [20, 25, 35, 55, 75, 85],
+        "description": "Better access to lower frequencies with substantially poorer access to higher frequencies.",
+    },
+    "Severe hearing loss": {
+        "left":  [70, 75, 80, 85, 90, 95],
+        "right": [70, 75, 80, 85, 90, 95],
+        "description": "An illustrative severe loss where unaided conversational speech may be largely inaccessible.",
+    },
+    "Asymmetric loss": {
+        "left":  [15, 15, 20, 25, 35, 45],
+        "right": [45, 50, 60, 70, 80, 90],
+        "description": "One ear has substantially poorer thresholds than the other.",
+    },
+}
+
 # -----------------------------
 # Audio helpers
 # -----------------------------
@@ -422,6 +455,7 @@ for key, value in {
     "source_sr": TARGET_SR,
     "source_label": None,
     "simulated_bytes": None,
+    "input_mode": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = value
@@ -430,18 +464,62 @@ for key, value in {
 # Audiogram
 # -----------------------------
 st.subheader("1. Add the audiogram")
+st.write("Choose how you want to start.")
 
-camera_tab, upload_tab, manual_tab = st.tabs(
-    ["Take a photo", "Upload PDF/photo", "Enter manually"]
-)
+b1, b2, b3, b4 = st.columns(4)
 
-with camera_tab:
+with b1:
+    if st.button(
+        "📷 Take photo",
+        use_container_width=True,
+        type="primary" if st.session_state.input_mode == "camera" else "secondary",
+    ):
+        st.session_state.input_mode = "camera"
+        st.rerun()
+
+with b2:
+    if st.button(
+        "⬆️ Upload",
+        use_container_width=True,
+        type="primary" if st.session_state.input_mode == "upload" else "secondary",
+    ):
+        st.session_state.input_mode = "upload"
+        st.rerun()
+
+with b3:
+    if st.button(
+        "🎧 Try example",
+        use_container_width=True,
+        type="primary" if st.session_state.input_mode == "preset" else "secondary",
+    ):
+        st.session_state.input_mode = "preset"
+        st.rerun()
+
+with b4:
+    if st.button(
+        "✏️ Enter manually",
+        use_container_width=True,
+        type="primary" if st.session_state.input_mode == "manual" else "secondary",
+    ):
+        st.session_state.input_mode = "manual"
+        st.rerun()
+
+if st.session_state.input_mode is None:
+    st.caption(
+        "No camera or upload panel opens until you choose an option."
+    )
+
+elif st.session_state.input_mode == "camera":
+    st.markdown("#### Take a photo")
     st.write(
-        "On a phone, tap below and photograph the audiogram. "
+        "On a phone, open the camera below and photograph the audiogram. "
         "Try to fill the frame with the page and avoid glare."
     )
 
-    camera_photo = st.camera_input("Take a picture of the audiogram")
+    camera_photo = st.camera_input(
+        "Open camera",
+        key="camera_audiogram",
+    )
 
     if camera_photo is not None:
         try:
@@ -451,15 +529,21 @@ with camera_tab:
             )
             st.image(img, caption="Camera photo", use_container_width=True)
 
-            if st.button("Read camera photo", type="primary", key="read_camera"):
+            if st.button(
+                "Read this audiogram",
+                type="primary",
+                key="read_camera",
+            ):
                 apply_detected_thresholds(img)
 
         except Exception as e:
             st.error(f"I couldn't read that camera photo: {e}")
 
-with upload_tab:
+elif st.session_state.input_mode == "upload":
+    st.markdown("#### Upload PDF or photo")
+
     ag_file = st.file_uploader(
-        "Upload an audiogram",
+        "Choose an audiogram",
         type=["pdf", "png", "jpg", "jpeg", "webp"],
         key="audiogram_file",
     )
@@ -470,16 +554,66 @@ with upload_tab:
                 ag_file.getvalue(),
                 ag_file.name,
             )
-            st.image(img, caption="Uploaded audiogram", use_container_width=True)
+            st.image(
+                img,
+                caption="Uploaded audiogram",
+                use_container_width=True,
+            )
 
-            if st.button("Read uploaded audiogram", type="primary", key="read_upload"):
+            if st.button(
+                "Read this audiogram",
+                type="primary",
+                key="read_upload",
+            ):
                 apply_detected_thresholds(img)
 
         except Exception as e:
             st.error(f"I couldn't read that audiogram: {e}")
 
-with manual_tab:
-    st.write("Enter the threshold values directly below.")
+elif st.session_state.input_mode == "preset":
+    st.markdown("#### Try an example hearing profile")
+    st.caption(
+        "These are illustrative profiles for exploring the simulator — "
+        "they are not diagnostic categories."
+    )
+
+    preset_name = st.selectbox(
+        "Example profile",
+        list(PRESET_PROFILES.keys()),
+        key="preset_selector",
+    )
+    preset = PRESET_PROFILES[preset_name]
+    st.write(preset["description"])
+
+    if st.button(
+        "Use this example",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.session_state.left = list(preset["left"])
+        st.session_state.right = list(preset["right"])
+
+        # Update existing number-input widget state too.
+        for i, f in enumerate(FREQS.astype(int)):
+            st.session_state[f"left_confirm_{f}"] = int(preset["left"][i])
+            st.session_state[f"right_confirm_{f}"] = int(preset["right"][i])
+
+        st.session_state.simulated_bytes = None
+
+        for key in [
+            "extraction_preview",
+            "extraction_straight",
+            "extraction_message",
+        ]:
+            st.session_state.pop(key, None)
+
+        st.success(f"{preset_name} loaded.")
+
+elif st.session_state.input_mode == "manual":
+    st.markdown("#### Enter values manually")
+    st.write(
+        "Enter the left- and right-ear hearing thresholds below."
+    )
 
 if "extraction_preview" in st.session_state:
     c1, c2 = st.columns(2)
