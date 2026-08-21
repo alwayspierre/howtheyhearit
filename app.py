@@ -12,7 +12,7 @@ from pydub import AudioSegment
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import resample_poly, stft, istft
 
-from PIL import Image, ImageOps, ImageDraw
+from PIL import Image, ImageEnhance, ImageDraw
 import cv2
 import fitz  # PyMuPDF
 
@@ -26,22 +26,6 @@ FREQS = np.array([250, 500, 1000, 2000, 4000, 8000], dtype=float)
 DEFAULT_LEFT = [10, 15, 25, 45, 65, 70]
 DEFAULT_RIGHT = [10, 15, 25, 50, 70, 75]
 TARGET_SR = 44100
-
-PROFILES = {
-    "Sloping moderate–severe loss": (DEFAULT_LEFT, DEFAULT_RIGHT),
-    "Mild high-frequency loss": (
-        [10, 10, 15, 20, 35, 45],
-        [10, 10, 15, 20, 35, 45],
-    ),
-    "Flat moderate loss": (
-        [45, 45, 45, 45, 45, 45],
-        [45, 45, 45, 45, 45, 45],
-    ),
-    "Normal / near-normal": (
-        [5, 5, 10, 10, 10, 10],
-        [5, 5, 10, 10, 10, 10],
-    ),
-}
 
 # -----------------------------
 # Audio helpers
@@ -150,6 +134,7 @@ def simulate_ear(x: np.ndarray, sr: int, thresholds, speech_level_db=65.0):
     Z2 = mag2 * np.exp(1j * phase)
     _, y = istft(Z2, fs=sr, nperseg=2048, noverlap=1536, input_onesided=True)
     y = y[:original_len]
+
     p = np.max(np.abs(y)) + 1e-9
     if p > 0.98:
         y = y * (0.98 / p)
@@ -168,12 +153,10 @@ def generate_tts(text: str):
     return decode_audio_bytes(mp3.getvalue(), ".mp3")
 
 # -----------------------------
-# Audiogram image/PDF helpers
+# Audiogram helpers
 # -----------------------------
-def load_audiogram_image(uploaded_file):
-    data = uploaded_file.getvalue()
-    name = uploaded_file.name.lower()
-
+def load_audiogram_image_from_bytes(data: bytes, filename: str = "image.jpg"):
+    name = filename.lower()
     if name.endswith(".pdf"):
         doc = fitz.open(stream=data, filetype="pdf")
         page = doc[0]
@@ -183,11 +166,77 @@ def load_audiogram_image(uploaded_file):
         return img
     return Image.open(io.BytesIO(data)).convert("RGB")
 
+def order_points(pts):
+    pts = np.asarray(pts, dtype=np.float32)
+    rect = np.zeros((4, 2), dtype=np.float32)
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).ravel()
+    rect[0] = pts[np.argmin(s)]   # top-left
+    rect[2] = pts[np.argmax(s)]   # bottom-right
+    rect[1] = pts[np.argmin(d)]   # top-right
+    rect[3] = pts[np.argmax(d)]   # bottom-left
+    return rect
+
+def four_point_transform(image, pts):
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    width_a = np.linalg.norm(br - bl)
+    width_b = np.linalg.norm(tr - tl)
+    max_w = int(max(width_a, width_b))
+
+    height_a = np.linalg.norm(tr - br)
+    height_b = np.linalg.norm(tl - bl)
+    max_h = int(max(height_a, height_b))
+
+    if max_w < 50 or max_h < 50:
+        return image
+
+    dst = np.array(
+        [[0, 0], [max_w - 1, 0], [max_w - 1, max_h - 1], [0, max_h - 1]],
+        dtype=np.float32,
+    )
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(image, M, (max_w, max_h))
+
+def auto_straighten_page(img: Image.Image):
+    """
+    Attempt to find the photographed sheet/page and correct perspective.
+    Falls back safely to the original image.
+    """
+    arr = np.array(img.convert("RGB"))
+    h, w = arr.shape[:2]
+
+    scale = min(1400 / max(h, w), 1.0)
+    small = cv2.resize(arr, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else arr.copy()
+
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY)
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(gray, 50, 150)
+
+    contours, _ = cv2.findContours(edged, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:15]
+
+    image_area = small.shape[0] * small.shape[1]
+
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.contourArea(approx) > image_area * 0.18:
+            pts = approx.reshape(4, 2).astype(np.float32)
+            warped = four_point_transform(small, pts)
+            if warped.size > 0:
+                return Image.fromarray(warped)
+
+    return img
+
+def enhance_for_detection(img: Image.Image):
+    img = img.convert("RGB")
+    img = ImageEnhance.Contrast(img).enhance(1.15)
+    img = ImageEnhance.Sharpness(img).enhance(1.15)
+    return img
+
 def detect_plot_region(img: Image.Image):
-    """
-    Heuristic detector for the main audiogram plotting rectangle.
-    Falls back to a central crop if no strong grid is found.
-    """
     arr = np.array(img.convert("RGB"))
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     gray = cv2.GaussianBlur(gray, (3,3), 0)
@@ -201,6 +250,7 @@ def detect_plot_region(img: Image.Image):
 
     h, w = gray.shape
     verticals, horizontals = [], []
+
     if lines is not None:
         for l in lines[:,0]:
             x1,y1,x2,y2 = map(int,l)
@@ -231,12 +281,11 @@ def detect_plot_region(img: Image.Image):
 def color_masks(crop_rgb):
     hsv = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2HSV)
 
-    # Red can wrap around hue 0
-    red1 = cv2.inRange(hsv, np.array([0, 70, 60]), np.array([12, 255, 255]))
-    red2 = cv2.inRange(hsv, np.array([168, 70, 60]), np.array([180, 255, 255]))
+    red1 = cv2.inRange(hsv, np.array([0, 65, 55]), np.array([14, 255, 255]))
+    red2 = cv2.inRange(hsv, np.array([165, 65, 55]), np.array([180, 255, 255]))
     red = cv2.bitwise_or(red1, red2)
 
-    blue = cv2.inRange(hsv, np.array([90, 60, 40]), np.array([140, 255, 255]))
+    blue = cv2.inRange(hsv, np.array([88, 50, 35]), np.array([145, 255, 255]))
 
     kernel = np.ones((3,3), np.uint8)
     red = cv2.morphologyEx(red, cv2.MORPH_OPEN, kernel)
@@ -248,6 +297,7 @@ def detect_points(mask, crop_w, crop_h):
     pts = []
     min_area = max(4, int(crop_w*crop_h*0.00001))
     max_area = max(1200, int(crop_w*crop_h*0.02))
+
     for i in range(1,n):
         x,y,w,h,area = stats[i]
         if min_area <= area <= max_area:
@@ -257,16 +307,11 @@ def detect_points(mask, crop_w, crop_h):
     return pts
 
 def extract_thresholds_from_image(img: Image.Image):
-    """
-    Heuristic extraction for common color audiograms:
-    - red symbols = right ear
-    - blue symbols = left ear
+    straight = auto_straighten_page(img)
+    processed = enhance_for_detection(straight)
 
-    Assumes the plotting region spans approximately 125/250 Hz to 8 kHz,
-    and -10 to 120 dB HL vertically.
-    """
-    box = detect_plot_region(img)
-    arr = np.array(img.convert("RGB"))
+    box = detect_plot_region(processed)
+    arr = np.array(processed.convert("RGB"))
     x1,y1,x2,y2 = box
     crop = arr[y1:y2, x1:x2]
     ch, cw = crop.shape[:2]
@@ -275,8 +320,6 @@ def extract_thresholds_from_image(img: Image.Image):
     red_pts = detect_points(red_mask, cw, ch)
     blue_pts = detect_points(blue_mask, cw, ch)
 
-    # Common audiogram octave positions represented evenly in log frequency.
-    # Model the chart as 125..8000 Hz and then read our six target frequencies.
     min_f, max_f = 125.0, 8000.0
     target_x = {
         int(f): (np.log2(f/min_f) / np.log2(max_f/min_f)) * cw
@@ -292,10 +335,10 @@ def extract_thresholds_from_image(img: Image.Image):
             if not candidates:
                 out[f] = None
                 continue
-            # Prefer the largest nearby component, then nearest x.
+
             candidates.sort(key=lambda p: (-p[2], abs(p[0]-tx)))
             cx, cy, area = candidates[0]
-            # Typical vertical range -10 dB top to 120 dB bottom
+
             db = -10 + (cy / max(ch-1,1)) * 130
             db = int(round(db/5)*5)
             out[f] = int(np.clip(db, -10, 120))
@@ -304,8 +347,7 @@ def extract_thresholds_from_image(img: Image.Image):
     right = map_points(red_pts)
     left = map_points(blue_pts)
 
-    # Annotated preview
-    preview = img.copy()
+    preview = processed.copy()
     draw = ImageDraw.Draw(preview)
     draw.rectangle(box, outline="green", width=4)
 
@@ -318,7 +360,27 @@ def extract_thresholds_from_image(img: Image.Image):
     draw_pts(red_pts, "red")
     draw_pts(blue_pts, "blue")
 
-    return left, right, preview, box, len(blue_pts), len(red_pts)
+    return left, right, straight, preview, len(blue_pts), len(red_pts)
+
+def apply_detected_thresholds(img):
+    left_detected, right_detected, straight, preview, nblue, nred = extract_thresholds_from_image(img)
+
+    found = 0
+    for i, f in enumerate(FREQS.astype(int)):
+        if left_detected[f] is not None:
+            st.session_state.left[i] = left_detected[f]
+            found += 1
+        if right_detected[f] is not None:
+            st.session_state.right[i] = right_detected[f]
+            found += 1
+
+    st.session_state.extraction_straight = straight
+    st.session_state.extraction_preview = preview
+    st.session_state.extraction_message = (
+        f"Detected {found} threshold values. "
+        f"Found {nblue} blue and {nred} red candidate marks."
+    )
+    st.session_state.simulated_bytes = None
 
 # -----------------------------
 # Styling
@@ -340,22 +402,19 @@ st.markdown(
 )
 
 st.title("How Might They Hear It?")
-st.caption("Audiogram-driven speech simulation — web prototype")
+st.caption("Audiogram-driven speech simulation — mobile-friendly prototype")
 
 st.markdown(
     """
     <div class="callout">
     <strong>Educational prototype, not a diagnostic or clinical tool.</strong>
     An audiogram cannot fully describe a person's subjective hearing.
-    Uploaded audiograms are interpreted heuristically and must be checked before use.
+    Camera/PDF extraction is approximate and must be checked before use.
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-# -----------------------------
-# State
-# -----------------------------
 for key, value in {
     "left": list(DEFAULT_LEFT),
     "right": list(DEFAULT_RIGHT),
@@ -363,72 +422,89 @@ for key, value in {
     "source_sr": TARGET_SR,
     "source_label": None,
     "simulated_bytes": None,
-    "extraction_message": None,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = value
 
 # -----------------------------
-# Audiogram upload / entry
+# Audiogram
 # -----------------------------
 st.subheader("1. Add the audiogram")
 
-audiogram_tab1, audiogram_tab2 = st.tabs(
-    ["Upload PDF or photo", "Enter values manually"]
+camera_tab, upload_tab, manual_tab = st.tabs(
+    ["Take a photo", "Upload PDF/photo", "Enter manually"]
 )
 
-with audiogram_tab1:
+with camera_tab:
+    st.write(
+        "On a phone, tap below and photograph the audiogram. "
+        "Try to fill the frame with the page and avoid glare."
+    )
+
+    camera_photo = st.camera_input("Take a picture of the audiogram")
+
+    if camera_photo is not None:
+        try:
+            img = load_audiogram_image_from_bytes(
+                camera_photo.getvalue(),
+                "camera.jpg",
+            )
+            st.image(img, caption="Camera photo", use_container_width=True)
+
+            if st.button("Read camera photo", type="primary", key="read_camera"):
+                apply_detected_thresholds(img)
+
+        except Exception as e:
+            st.error(f"I couldn't read that camera photo: {e}")
+
+with upload_tab:
     ag_file = st.file_uploader(
         "Upload an audiogram",
         type=["pdf", "png", "jpg", "jpeg", "webp"],
         key="audiogram_file",
-        help="For best automatic detection, use a clear colour audiogram with red right-ear and blue left-ear symbols."
     )
 
     if ag_file is not None:
         try:
-            img = load_audiogram_image(ag_file)
+            img = load_audiogram_image_from_bytes(
+                ag_file.getvalue(),
+                ag_file.name,
+            )
             st.image(img, caption="Uploaded audiogram", use_container_width=True)
 
-            if st.button("Read this audiogram", type="primary"):
-                left_detected, right_detected, preview, box, nblue, nred = extract_thresholds_from_image(img)
+            if st.button("Read uploaded audiogram", type="primary", key="read_upload"):
+                apply_detected_thresholds(img)
 
-                found = 0
-                for i, f in enumerate(FREQS.astype(int)):
-                    if left_detected[f] is not None:
-                        st.session_state.left[i] = left_detected[f]
-                        found += 1
-                    if right_detected[f] is not None:
-                        st.session_state.right[i] = right_detected[f]
-                        found += 1
-
-                st.session_state.extraction_preview = preview
-                st.session_state.extraction_message = (
-                    f"Detected {found} threshold values. "
-                    f"Found {nblue} blue and {nred} red candidate marks."
-                )
-                st.session_state.simulated_bytes = None
-
-            if "extraction_preview" in st.session_state:
-                st.image(
-                    st.session_state.extraction_preview,
-                    caption="What the app detected — green box is the assumed chart region; coloured circles are candidate threshold marks.",
-                    use_container_width=True,
-                )
-                st.info(st.session_state.extraction_message)
-                st.warning(
-                    "Please confirm the extracted values below. Audiogram layouts and symbols vary, "
-                    "so automatic extraction can be wrong."
-                )
         except Exception as e:
             st.error(f"I couldn't read that audiogram: {e}")
 
-with audiogram_tab2:
-    st.caption(
-        "You can always enter the audiogram directly if automatic extraction misses some values."
+with manual_tab:
+    st.write("Enter the threshold values directly below.")
+
+if "extraction_preview" in st.session_state:
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("**Straightened image**")
+        st.image(
+            st.session_state.extraction_straight,
+            use_container_width=True,
+        )
+
+    with c2:
+        st.markdown("**Detected chart and marks**")
+        st.image(
+            st.session_state.extraction_preview,
+            use_container_width=True,
+        )
+
+    st.info(st.session_state.extraction_message)
+    st.warning(
+        "Please check every extracted threshold below before simulation. "
+        "Camera angle, glare and unusual audiogram formats can cause errors."
     )
 
-st.markdown("#### Confirm the thresholds (dB HL)")
+st.markdown("#### Confirm thresholds (dB HL)")
 left_col, right_col = st.columns(2)
 
 with left_col:
@@ -463,11 +539,11 @@ with right_col:
 
 st.caption(
     "Common convention: red = right ear, blue = left ear. "
-    "Always verify against the original audiogram before simulating."
+    "Always verify against the original audiogram."
 )
 
 # -----------------------------
-# Source speech
+# Speech input
 # -----------------------------
 st.divider()
 st.subheader("2. Choose what you want them to hear")
@@ -482,6 +558,7 @@ with source_tab1:
         value="Can you please put your shoes on?",
         height=90,
     )
+
     if st.button("Generate normal speech", type="primary"):
         try:
             x, sr = generate_tts(text)
@@ -495,12 +572,13 @@ with source_tab1:
             st.caption(str(e))
 
     st.caption(
-        "Privacy note: typed text is sent to Google's text-to-speech service. "
+        "Typed text is sent to Google's text-to-speech service. "
         "Do not include identifying patient information."
     )
 
 with source_tab2:
     recording = st.audio_input("Record a sentence", sample_rate=16000)
+
     if recording is not None:
         try:
             x, sr = decode_audio_bytes(recording.getvalue(), ".wav")
@@ -516,8 +594,9 @@ with source_tab3:
     uploaded = st.file_uploader(
         "Upload WAV, MP3, M4A or similar audio",
         type=["wav", "mp3", "m4a", "aac", "ogg", "flac"],
-        key="speech_upload"
+        key="speech_upload",
     )
+
     if uploaded is not None:
         try:
             suffix = "." + uploaded.name.split(".")[-1].lower()
@@ -564,15 +643,20 @@ if st.button("Simulate hearing", type="primary", use_container_width=True):
 
 if st.session_state.simulated_bytes is not None:
     c1, c2 = st.columns(2)
+
     with c1:
         st.markdown("#### Normal")
         st.audio(
             wav_bytes(st.session_state.source_wav, st.session_state.source_sr),
             format="audio/wav",
         )
+
     with c2:
         st.markdown("#### Simulated")
-        st.audio(st.session_state.simulated_bytes, format="audio/wav")
+        st.audio(
+            st.session_state.simulated_bytes,
+            format="audio/wav",
+        )
         st.caption("Stereo: left-ear simulation / right-ear simulation.")
 
     st.info("For left/right differences, listen through headphones.")
@@ -584,24 +668,24 @@ if st.session_state.simulated_bytes is not None:
         mime="audio/wav",
     )
 
-with st.expander("Scientific limitations"):
+with st.expander("Camera and scientific limitations"):
     st.markdown(
         """
-        The hearing simulation remains an **educational approximation** and is not
-        a validated reconstruction of an individual's subjective hearing.
+        **Camera reader:** the app attempts to find the photographed page,
+        correct perspective, improve contrast, locate the audiogram grid,
+        and identify conventional red/right and blue/left marks.
 
-        The audiogram reader is also heuristic. It works best with conventional
-        colour audiograms using red right-ear and blue left-ear markings.
-        It may fail on monochrome audiograms, unusual chart layouts, bone-conduction
-        symbols, masking symbols, or low-quality photographs.
+        It will not work reliably for every audiogram. Glare, shadows,
+        monochrome charts, handwriting, unusual symbols, masking/bone-conduction
+        notation and non-standard graph layouts can all cause errors.
 
-        The extracted thresholds must therefore be confirmed against the original
-        audiogram before using the simulation.
+        **Hearing simulation:** this remains an educational approximation,
+        not a validated reconstruction of an individual's subjective hearing.
         """
     )
 
 st.divider()
 st.caption(
-    "Prototype V2 · Do not upload names, dates of birth, patient numbers, "
+    "Prototype V3 · Do not upload names, dates of birth, patient numbers, "
     "or other identifying health information."
 )
